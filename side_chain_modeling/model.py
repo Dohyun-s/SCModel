@@ -69,8 +69,7 @@ class ProteinMPNN(nn.Module):
         """ Graph-conditioned sequence model """
         device=dist_ca.device
         # Prepare node and edge embeddings
-        E, E_idx = self.features(dist_ca, omega, theta, phi, dihedral, mask_angle, mask, residue_idx, chain_encoding_all)
-        node_v = dihedral
+        V, E, E_idx = self.features(dist_ca, omega, theta, phi, dihedral, mask_angle, mask, S, residue_idx, chain_encoding_all)
         # h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
         # h_E = self.W_e(E)
 
@@ -79,7 +78,7 @@ class ProteinMPNN(nn.Module):
         # mask_attend = mask.unsqueeze(-1) * mask_attend
         # for layer in self.encoder_layers:
         #     h_V, h_E = torch.utils.checkpoint.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
-        h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
+        h_V = V.to(E.device)
         h_E = self.W_e(E)
 
         # Encoder is unmasked self-attention
@@ -91,9 +90,9 @@ class ProteinMPNN(nn.Module):
         
         h_EV = h_E.mean(-2) + h_V
 #         h_EV = self.ln_post(h_EV.mean(dim=1))
-        result = self.scpred(h_EV)
-        return result
-
+#         result = self.scpred(h_EV)
+#         return result
+        return h_V, h_E
     
 class ProteinFeatures(nn.Module):
     def __init__(self, edge_features=128, num_positional_embeddings=16,
@@ -110,13 +109,17 @@ class ProteinFeatures(nn.Module):
         self.norm_edges = nn.LayerNorm(edge_features)
         self.num_rbf = num_rbf
         
+#         self.node_embedding = nn.Linear(node_in, edge_features, bias=False)
+        self.node_embedding = nn.Embedding(22, 6, padding_idx=21)
+        self.node_embedding2 = nn.Linear(6, edge_features, bias=True)
+        self.norm_nodes = nn.LayerNorm(edge_features)
     def _dist(self, dist_ca, mask_angle, eps=1E-6):
         D = mask_angle * dist_ca
         D_max, _ = torch.max(D, -1, keepdim=True)
         D_adjust = D + (1. - mask_angle) * D_max
         # number of Ca atoms is 14.
-        Ca_dim = 14
-        D_neighbors, E_idx = torch.topk(D_adjust, np.minimum(self.top_k, Ca_dim), dim=-1, largest=False)
+        Ca_dim = 32
+        D_neighbors, E_idx = torch.topk(D_adjust, np.maximum(self.top_k, Ca_dim), dim=-1, largest=False)
         return D_neighbors, E_idx
     
     def _rbf(self, D):
@@ -129,7 +132,7 @@ class ProteinFeatures(nn.Module):
         RBF = torch.exp(-((D_expand - D_mu) / D_sigma)**2)
         return RBF
     
-    def forward(self, dist_ca, omega, theta, phi, dihedral, mask_angle, mask, residue_idx, chain_encoding_all):
+    def forward(self, dist_ca, omega, theta, phi, dihedral, mask_angle, mask, S, residue_idx, chain_encoding_all):
         D_neighbors, E_idx = self._dist(dist_ca, mask_angle)
         offset = residue_idx[:,:,None] - residue_idx[:,None,:]
         
@@ -146,7 +149,13 @@ class ProteinFeatures(nn.Module):
         E = torch.cat((E_positional, RBF_all), -1)
         E = self.edge_embedding(E)
         E = self.norm_edges(E)  # positional + ca-distance
-        return E, E_idx
+        
+#         V = node_embe.cat((torch.unsqueeze(S, -1), dihedral), dim=-1)
+        V = self.node_embedding(S)
+        V = V + dihedral
+        V = self.node_embedding2(V)
+        V = self.norm_nodes(V)
+        return V, E, E_idx
 
     
 class PositionalEncodings(nn.Module):
