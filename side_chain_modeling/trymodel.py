@@ -1,4 +1,5 @@
 import torch.nn as nn
+import torch
 import numpy as np
 from einops import rearrange
 class ProteinMPNN(nn.Module):

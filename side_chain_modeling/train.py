@@ -2,7 +2,7 @@ import sys
 sys.path.append("..")
 from ProteinMPNN.training.utils import build_training_clusters, StructureDataset, StructureLoader, \
                         PDB_dataset, loader_pdb, worker_init_fn
-from ProteinMPNN.training.model_utils import get_std_opt
+from ProteinMPNN.training.model_utils import get_std_opt, get_scheduler
 
 import torch
 import numpy as np
@@ -14,6 +14,7 @@ import scipy
 import scipy.spatial
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 
 import queue
 import time
@@ -22,6 +23,14 @@ use_cuda = torch.cuda.is_available()
 
 device = torch.device("cuda" if use_cuda else "cpu")
 print("Device: ",device)
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="side_chain_modeling",
+    # track hyperparameters and run metadata
+    config={
+    "epochs": 200,
+    }, resume="allow", allow_val_change=True
+)
 
 from util import get_coords6d, _dihedrals, _normalize, get_pdbs, generate_Cbeta,\
     get_dihedrals, get_angles, featurize
@@ -33,7 +42,7 @@ LOCAL_PATH = "/home/minsu/CLIPP/training_data/pdb_2021aug02_sample"
 DATA_PATH = "/public_data/ml/RF2_train/PDB-2021AUG02"
 MY_LOCAL = "/home/dohyun/project/"
 PARAMS = {
-    "LIST"    : f"{MY_LOCAL}/train_s",
+    "LIST"    : f"{LOCAL_PATH}/list.csv",
     "VAL"     : f"{DATA_PATH}/PDB_val",
     "TEST"    : f"{LOCAL_PATH}/test_clusters.txt",
     "STRUCT_CLUST" : f"{LOCAL_PATH}/seq_hash_to_clust_hash.yaml",  
@@ -70,7 +79,6 @@ mixed_precision = True
 epoch = 0
 gradient_norm = 1.0
 scaler = torch.cuda.amp.GradScaler()
-logfile = 'log.txt'
 model = ProteinMPNN(node_features=hidden_dim, 
                         edge_features=hidden_dim, 
                         hidden_dim=hidden_dim, 
@@ -80,8 +88,12 @@ model = ProteinMPNN(node_features=hidden_dim,
                         dropout=dropout, 
                         augment_eps=backbone_noise)
 model.to(device)
+wandb.watch(model)
+
 total_step = 0
 optimizer = get_std_opt(model.parameters(), hidden_dim, total_step)
+num_warmup_steps = 4000
+scheduler = get_scheduler(optimizer.optimizer, warmup_steps=num_warmup_steps)
 
 from concurrent.futures import ProcessPoolExecutor    
 
@@ -99,11 +111,16 @@ with ProcessPoolExecutor(max_workers=12) as executor:
 
     loader_train = StructureLoader(dataset_train, batch_size=batch_size)
     loader_valid = StructureLoader(dataset_valid, batch_size=batch_size)
-   
-    for e in range(10):
+
+    wandb.config.train_dataset_length = len(loader_train)
+    wandb.config.val_dataset_length = len(loader_valid)
+    print("\ttrain data len:", wandb.config.train_dataset_length)
+    print("\tval data len:", wandb.config.val_dataset_length)
+
+    for e in range(250):
         t0 = time.time()
         e = epoch + e
-        avg_loss = 0.0
+        train_avg_loss, train_weights = 0.0, 0.0
         model.train()
         start_batch = time.time()
         for _, batch in enumerate(loader_train):
@@ -111,7 +128,6 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                                 chain_encoding_all = featurize(batch, device)
             optimizer.zero_grad()
             mask_for_loss = mask*chain_M
-            alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
             alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
             tors = []
             for s in range(len(batch)):
@@ -124,7 +140,7 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                             torch.unsqueeze(coord,0), 
                             torch.unsqueeze(torch.from_numpy(seq_aa),0).to(dtype=torch.long)
                 )
-                tors.append([true_tors, true_tors_alt, tors_mask, tors_planar])
+                tors.append([true_tors.to(device), true_tors_alt.to(device), tors_mask.to(device), tors_planar.to(device)])
             
             if mixed_precision:
                 with torch.cuda.amp.autocast():
@@ -139,14 +155,15 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                         l_tors_sum += l_tors
 #                     _, loss_av_smoothed = loss_smoothed(S, log_probs, mask_for_loss)
 
-                scaler.scale(l_tors).backward()
+                scaler.scale(l_tors_sum).backward()
 
                 if gradient_norm > 0.0:
                     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
 
                 scaler.step(optimizer)
                 scaler.update()
-                avg_loss += l_tors.detach()
+                scheduler.step()
+                train_avg_loss += l_tors.detach()
             else:
                 result = model(dist_ca, omega, theta, phi, dihedral, mask_angle, mask, \
                                 S, chain_M, residue_idx, chain_encoding_all)
@@ -157,25 +174,30 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                     l_tors = torsionAngleLoss(result[s][:nres].unsqueeze(0), true_tors, true_tors_alt, \
                                                 tors_mask, tors_planar, eps = 1e-10)
                     l_tors_sum += l_tors
-                l_tors.backward()
+                l_tors_sum.backward()
 
                 if gradient_norm > 0.0:
                     total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                 optimizer.step()
-                avg_loss += l_tors.detach()
-        elapsed_featurize = time.time() - start_batch
+                scheduler.step()
+                train_avg_loss += l_tors_sum.detach()
             
-        avg_loss = avg_loss / len(loader_train)
-        print ("Train epoch{}, time {:.2f}, loss {} ".format(e, elapsed_featurize, avg_loss.item()))
+            train_weights += torch.sum(mask_for_loss).cpu().data.numpy()
+        elapsed_featurize = time.time() - start_batch
+        
+        train_avg_loss = train_avg_loss / train_weights
+        print ("Train epoch{}, time {:.2f}, loss {} ".format(e, elapsed_featurize, train_avg_loss.item()))
 
         model.eval()
-        avg_loss = 0.0
+        val_avg_loss, validation_weights = 0.0, 0.0
         with torch.no_grad():
             for _, batch in enumerate(loader_valid):
                 dist_ca, omega, theta, phi, dihedral, mask_angle, mask, S, chain_M, residue_idx,\
                                 chain_encoding_all = featurize(batch, device)
                 result = model(dist_ca, omega, theta, phi, dihedral, mask_angle, mask, \
                                     S, chain_M, residue_idx, chain_encoding_all)
+                mask_for_loss = mask*chain_M
+                validation_weights += torch.sum(mask_for_loss).cpu().data.numpy()
                 tors = []
                 for s in range(len(batch)):
                     all_chains = batch[s]['visible_list']+batch[s]['masked_list']
@@ -187,7 +209,7 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                                 torch.unsqueeze(coord,0), 
                                 torch.unsqueeze(torch.from_numpy(seq_aa),0).to(dtype=torch.long)
                     )
-                    tors.append([true_tors, true_tors_alt, tors_mask, tors_planar])
+                    tors.append([true_tors.to(device), true_tors_alt.to(device), tors_mask.to(device), tors_planar.to(device)])
                 
                 l_tors_sum = 0
                 for s in range(len(batch)):
@@ -196,13 +218,19 @@ with ProcessPoolExecutor(max_workers=12) as executor:
                     l_tors = torsionAngleLoss(result[s][:nres].unsqueeze(0), true_tors, true_tors_alt, \
                                                 tors_mask, tors_planar, eps = 1e-10)
                     l_tors_sum += l_tors
-                avg_loss += l_tors_sum.detach()
-        avg_loss = avg_loss / len(loader_valid)
-        print ("valid epoch {}, loss {} ".format(e, avg_loss.item()))
+                val_avg_loss += l_tors_sum.detach()
+        val_avg_loss = val_avg_loss / validation_weights
+        print ("valid epoch {}, loss {} ".format(e, val_avg_loss.item()))
         
+        wandb.log({"step": e,
+                   "train_loss": train_avg_loss,
+                   "val_loss": val_avg_loss,
+                   }
+                  )
         torch.save({
                 'epoch': e,
                 'model_state_dict': model.state_dict(),
-#                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
+                'optimizer_state_dict': optimizer.optimizer.state_dict(),
+                'train_loss': train_avg_loss,
+                'val_loss': val_avg_loss,
                 }, 'model.pt')

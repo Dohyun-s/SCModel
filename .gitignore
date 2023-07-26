@@ -1,5 +1,14 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+side_chain_modeling/variable/*
+side_chain_modeling/script.sh
+side_chain_modeling/train.err
+side_chain_modeling/train.out
+side_chain_modeling/train_exam.py
+side_chain_modeling/list.csv
+side_chain_modeling/model.pt
+
+side_chain_modeling/wandb/*
 *.py[cod]
 *$py.class
 

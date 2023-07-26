@@ -1,9 +1,10 @@
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.checkpoint
 import numpy as np
 from einops import rearrange
+import torch.utils.checkpoint
+import torch.nn.functional as F
+import math
+from torch import einsum
 
 class ProteinMPNN(nn.Module):
     def __init__(
@@ -42,7 +43,7 @@ class ProteinMPNN(nn.Module):
         edge_in = num_positional_embeddings * 8 #+ self.num_rbf*25
         self.ln_post = nn.LayerNorm(hidden_dim)
         self.embeddings = PositionalEncodings(num_positional_embeddings)
-
+        self.attention_bias = AttentionWithBias(d_in=128, d_bias=32, n_head=8, d_hidden=16)
         #         self.structure_projection = nn.Parameter(torch.randn(128, 512))
 
         for p in self.parameters():
@@ -87,12 +88,9 @@ class ProteinMPNN(nn.Module):
         for layer in self.encoder_layers:
 #             h_V, h_E = torch.utils.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
-        
-        h_EV = h_E.mean(-2) + h_V
-#         h_EV = self.ln_post(h_EV.mean(dim=1))
-#         result = self.scpred(h_EV)
-#         return result
-        return h_V, h_E
+        h_EV = self.attention_bias(h_V, h_E) + h_V
+        result = self.scpred(h_EV)
+        return result
     
 class ProteinFeatures(nn.Module):
     def __init__(self, edge_features=128, num_positional_embeddings=16,
@@ -109,6 +107,7 @@ class ProteinFeatures(nn.Module):
         self.norm_edges = nn.LayerNorm(edge_features)
         self.num_rbf = num_rbf
         
+        node_in = 7 # dihedral 6 + residue_idx 1
 #         self.node_embedding = nn.Linear(node_in, edge_features, bias=False)
         self.node_embedding = nn.Embedding(22, 6, padding_idx=21)
         self.node_embedding2 = nn.Linear(6, edge_features, bias=True)
@@ -318,3 +317,73 @@ def init_lecun_normal(module, scale=1.0):
 
     module.weight = torch.nn.Parameter( (sample_truncated_normal(module.weight.shape)) )
     return module
+
+
+class AttentionWithBias(nn.Module):
+    def __init__(self, d_in=128, d_bias=32, n_head=8, d_hidden=32):
+        super(AttentionWithBias, self).__init__()
+        self.norm_in = nn.LayerNorm(d_in)
+        self.norm_bias = nn.LayerNorm(d_bias)
+        #
+        self.to_q = nn.Linear(d_in, n_head*d_hidden, bias=False)
+        self.to_k = nn.Linear(d_in, n_head*d_hidden, bias=False)
+        self.to_v = nn.Linear(d_in, n_head*d_hidden, bias=False)
+
+        self.to_b = nn.Linear(d_bias, 1, bias=False)
+        self.to_b2 = nn.Linear(d_in, n_head, bias=False)
+        self.to_g = nn.Linear(d_in, n_head*d_hidden)
+        self.to_out = nn.Linear(n_head*d_hidden, d_in)
+
+        self.scaling = 1/math.sqrt(d_hidden)
+        self.h = n_head
+        self.dim = d_hidden
+
+        self.reset_parameter()
+
+    def reset_parameter(self):
+        # query/key/value projection: Glorot uniform / Xavier uniform
+        nn.init.xavier_uniform_(self.to_q.weight)
+        nn.init.xavier_uniform_(self.to_k.weight)
+        nn.init.xavier_uniform_(self.to_v.weight)
+
+        # bias: normal distribution
+        self.to_b = init_lecun_normal(self.to_b)
+
+        # gating: zero weights, one biases (mostly open gate at the begining)
+        nn.init.zeros_(self.to_g.weight)
+        nn.init.ones_(self.to_g.bias)
+
+        # to_out: right before residual connection: zero initialize -- to make it sure residual operation is same to the Identity at the begining
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+
+    def forward(self, x, bias):
+        B, L = x.shape[:2]
+        #
+        x = self.norm_in(x)
+        bias = rearrange(bias, 'b l t h -> b l h t')
+        bias = self.norm_bias(bias)
+        #
+        query = self.to_q(x).reshape(B, L, self.h, self.dim)
+        key = self.to_k(x).reshape(B, L, self.h, self.dim)
+        value = self.to_v(x).reshape(B, L, self.h, self.dim)
+        # query = rearrange(self.to_q(x), 'b l (h d) -> b l h d', h=self.h)
+        # key = rearrange(self.to_k(x), 'b l (h d) -> b l h d', h=self.h)
+        # value = rearrange(self.to_v(x), 'b l (h d) -> b l h d', h=self.h)
+#         bias = self.to_b(bias) # (B, L, L, h)
+        bias = self.to_b(bias).squeeze(-1)
+        bias = bias.unsqueeze(2).expand(-1, -1, L, -1)
+
+        bias = self.to_b2(bias)
+        gate = torch.sigmoid(self.to_g(x))
+
+        key = key * self.scaling
+        attn = einsum('bqhd,bkhd->bqkh', query, key)
+        attn = attn + bias
+        attn = F.softmax(attn, dim=-1)
+        #
+        out = einsum('bqkh,bkhd->bqhd', attn, value).reshape(B, L, -1)
+        out = gate * out
+        #
+        out = self.to_out(out)
+        return out

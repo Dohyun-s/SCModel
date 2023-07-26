@@ -130,6 +130,11 @@ def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
                         if res.shape[1] < 4:
                             pass
                         else:
+                            all_atoms = torch.Tensor(t['xyz'][res,])[0,] #[L, 14, 3]
+                            try:
+                                dist_ca, omega6d, theta6d, phi6d = get_coords6d(all_atoms, 20.0)
+                            except Exception:
+                                continue
                             my_dict['seq_chain_'+letter]= "".join(list(np.array(list(t['seq']))[res][0,]))
                             concat_seq += my_dict['seq_chain_'+letter]
                             if idx in t['masked']:
@@ -137,11 +142,6 @@ def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
                             else:
                                 visible_list.append(letter)
                             coords_dict_chain = {}
-                            all_atoms = torch.Tensor(t['xyz'][res,])[0,] #[L, 14, 3]
-                            try:
-                                dist_ca, omega6d, theta6d, phi6d = get_coords6d(all_atoms, 20.0)
-                            except Exception:
-                                continue
                             coords_dict_chain['dihedral_'+letter]=_dihedrals(all_atoms)
                             coords_dict_chain['omega'+letter]=omega6d
                             coords_dict_chain['theta'+letter]=dist_ca
@@ -326,6 +326,7 @@ def featurize(batch, device):
         # Convert to labels
         indices = np.asarray([alphabet.index(a) for a in all_sequence], dtype=np.int32)
         S[i, :l] = indices
+        S[i, l:] = 21
 
     dist_ca[np.isnan(dist_ca)] = 0.
     omega[np.isnan(omega)] = 0.
