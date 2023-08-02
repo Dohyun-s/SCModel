@@ -80,6 +80,7 @@ class ProteinMPNN(nn.Module):
         # for layer in self.encoder_layers:
         #     h_V, h_E = torch.utils.checkpoint.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
         h_V = V.to(E.device)
+        E_idx = E_idx.to(E.device)
         h_E = self.W_e(E)
 
         # Encoder is unmasked self-attention
@@ -88,7 +89,7 @@ class ProteinMPNN(nn.Module):
         for layer in self.encoder_layers:
 #             h_V, h_E = torch.utils.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
-        h_EV = self.attention_bias(h_V, h_E) + h_V
+        h_EV = self.attention_bias(h_V, h_E, E_idx) + h_V
         result = self.scpred(h_EV)
         return result
     
@@ -110,8 +111,9 @@ class ProteinFeatures(nn.Module):
         node_in = 7 # dihedral 6 + residue_idx 1
 #         self.node_embedding = nn.Linear(node_in, edge_features, bias=False)
         self.node_embedding = nn.Embedding(22, 6, padding_idx=21)
-        self.node_embedding2 = nn.Linear(6, edge_features, bias=True)
+        self.node_embedding2 = nn.Linear(12, edge_features, bias=True)
         self.norm_nodes = nn.LayerNorm(edge_features)
+
     def _dist(self, dist_ca, mask_angle, eps=1E-6):
         D = mask_angle * dist_ca
         D_max, _ = torch.max(D, -1, keepdim=True)
@@ -151,7 +153,8 @@ class ProteinFeatures(nn.Module):
         
 #         V = node_embe.cat((torch.unsqueeze(S, -1), dihedral), dim=-1)
         V = self.node_embedding(S)
-        V = V + dihedral
+        # V = V + dihedral
+        V = torch.cat((V, dihedral), dim=-1)
         V = self.node_embedding2(V)
         V = self.norm_nodes(V)
         return V, E, E_idx
@@ -250,6 +253,7 @@ def gather_nodes(nodes, neighbor_idx):
     return neighbor_features
 
 
+
 class SCPred(nn.Module):
     def __init__(self, d_hidden=128):
         super(SCPred, self).__init__()
@@ -323,14 +327,13 @@ class AttentionWithBias(nn.Module):
     def __init__(self, d_in=128, d_bias=32, n_head=8, d_hidden=32):
         super(AttentionWithBias, self).__init__()
         self.norm_in = nn.LayerNorm(d_in)
-        self.norm_bias = nn.LayerNorm(d_bias)
+        self.norm_bias = nn.LayerNorm(d_bias,)
         #
         self.to_q = nn.Linear(d_in, n_head*d_hidden, bias=False)
         self.to_k = nn.Linear(d_in, n_head*d_hidden, bias=False)
         self.to_v = nn.Linear(d_in, n_head*d_hidden, bias=False)
 
-        self.to_b = nn.Linear(d_bias, 1, bias=False)
-        self.to_b2 = nn.Linear(d_in, n_head, bias=False)
+        self.to_b = nn.Linear(d_in, n_head, bias=False)
         self.to_g = nn.Linear(d_in, n_head*d_hidden)
         self.to_out = nn.Linear(n_head*d_hidden, d_in)
 
@@ -357,24 +360,24 @@ class AttentionWithBias(nn.Module):
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
 
-    def forward(self, x, bias):
+    def forward(self, x, bias, E_idx):
         B, L = x.shape[:2]
         #
         x = self.norm_in(x)
         bias = rearrange(bias, 'b l t h -> b l h t')
         bias = self.norm_bias(bias)
+        bias = rearrange(bias, 'b l h t -> b l t h')
         #
         query = self.to_q(x).reshape(B, L, self.h, self.dim)
         key = self.to_k(x).reshape(B, L, self.h, self.dim)
         value = self.to_v(x).reshape(B, L, self.h, self.dim)
-        # query = rearrange(self.to_q(x), 'b l (h d) -> b l h d', h=self.h)
-        # key = rearrange(self.to_k(x), 'b l (h d) -> b l h d', h=self.h)
-        # value = rearrange(self.to_v(x), 'b l (h d) -> b l h d', h=self.h)
-#         bias = self.to_b(bias) # (B, L, L, h)
-        bias = self.to_b(bias).squeeze(-1)
-        bias = bias.unsqueeze(2).expand(-1, -1, L, -1)
 
-        bias = self.to_b2(bias)
+        B, L, I, H = bias.shape
+        input_tensor = torch.zeros((B, L, L, H), device=bias.device)
+        expanded_E_idx = E_idx.unsqueeze(3).expand(-1, -1, -1, H)
+        bias = torch.scatter(input_tensor, 2, expanded_E_idx, bias)
+        bias = self.to_b(bias)
+
         gate = torch.sigmoid(self.to_g(x))
 
         key = key * self.scaling
