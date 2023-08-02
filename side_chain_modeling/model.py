@@ -5,6 +5,7 @@ import torch.utils.checkpoint
 import torch.nn.functional as F
 import math
 from torch import einsum
+from memory_efficient_attention import efficient_dot_product_attention_pt
 
 class ProteinMPNN(nn.Module):
     def __init__(
@@ -89,7 +90,7 @@ class ProteinMPNN(nn.Module):
         for layer in self.encoder_layers:
 #             h_V, h_E = torch.utils.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
             h_V, h_E = layer(h_V, h_E, E_idx, mask, mask_attend)
-        h_EV = self.attention_bias(h_V, h_E, E_idx) + h_V
+        h_EV = self.attention_bias(h_V, h_E, E_idx, mask_attend) + h_V
         result = self.scpred(h_EV)
         return result
     
@@ -327,7 +328,8 @@ class AttentionWithBias(nn.Module):
     def __init__(self, d_in=128, d_bias=32, n_head=8, d_hidden=32):
         super(AttentionWithBias, self).__init__()
         self.norm_in = nn.LayerNorm(d_in)
-        self.norm_bias = nn.LayerNorm(d_bias,)
+        self.norm_bias = nn.LayerNorm(d_in)
+        self.norm_bias2 = nn.LayerNorm(n_head)
         #
         self.to_q = nn.Linear(d_in, n_head*d_hidden, bias=False)
         self.to_k = nn.Linear(d_in, n_head*d_hidden, bias=False)
@@ -360,13 +362,13 @@ class AttentionWithBias(nn.Module):
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
 
-    def forward(self, x, bias, E_idx):
+    def forward(self, x, bias, E_idx, mask_attend):
         B, L = x.shape[:2]
         #
         x = self.norm_in(x)
-        bias = rearrange(bias, 'b l t h -> b l h t')
-        bias = self.norm_bias(bias)
-        bias = rearrange(bias, 'b l h t -> b l t h')
+        # bias = rearrange(bias, 'b l t h -> b l h t')
+        # bias = self.norm_bias(bias)
+        # bias = rearrange(bias, 'b l h t -> b l t h')
         #
         query = self.to_q(x).reshape(B, L, self.h, self.dim)
         key = self.to_k(x).reshape(B, L, self.h, self.dim)
@@ -375,17 +377,24 @@ class AttentionWithBias(nn.Module):
         B, L, I, H = bias.shape
         input_tensor = torch.zeros((B, L, L, H), device=bias.device)
         expanded_E_idx = E_idx.unsqueeze(3).expand(-1, -1, -1, H)
+        # bias = self.norm_bias(bias)
         bias = torch.scatter(input_tensor, 2, expanded_E_idx, bias)
         bias = self.to_b(bias)
-
+        bias = self.norm_bias2(bias)
+        
+        input_tensor = torch.zeros((B, L, L), device=bias.device)
+        mask = torch.scatter(input_tensor, 2, E_idx, mask_attend)
+        mask = mask.unsqueeze(1).expand(-1, self.h, -1, -1)
         gate = torch.sigmoid(self.to_g(x))
 
         key = key * self.scaling
-        attn = einsum('bqhd,bkhd->bqkh', query, key)
-        attn = attn + bias
-        attn = F.softmax(attn, dim=-1)
-        #
-        out = einsum('bqkh,bkhd->bqhd', attn, value).reshape(B, L, -1)
+        # attn = einsum('bqhd,bkhd->bqkh', query, key)
+        # attn = attn + bias
+        # attn = F.softmax(attn, dim=-1)
+        # #
+        # out = einsum('bqkh,bkhd->bqhd', attn, value).reshape(B, L, -1)
+        out = efficient_dot_product_attention_pt(query, key, value, mask.to(torch.bool), \
+                                           bias.transpose(-1,1)).reshape(B, L, -1)
         out = gate * out
         #
         out = self.to_out(out)
