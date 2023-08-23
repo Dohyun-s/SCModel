@@ -5,7 +5,6 @@ import torch.utils.checkpoint
 import torch.nn.functional as F
 import math
 from torch import einsum
-from memory_efficient_attention import efficient_dot_product_attention_pt
 
 class ProteinMPNN(nn.Module):
     def __init__(
@@ -298,6 +297,7 @@ class SCPred(nn.Module):
         si = si + self.linear_4(F.relu_(self.linear_3(F.relu_(si))))
 
         si = self.linear_out(F.relu_(si))
+        si /= torch.sqrt(torch.sum(torch.square(si), axis=-1, keepdims=True) + 1e-8)
         return si.view(B, L, self.NTOTAL, 2)
 
 def init_lecun_normal(module, scale=1.0):
@@ -330,16 +330,14 @@ class AttentionWithBias(nn.Module):
         self.norm_in = nn.LayerNorm(d_in)
         self.norm_bias = nn.LayerNorm(d_in)
         self.norm_bias2 = nn.LayerNorm(n_head)
-        #
-        self.to_q = nn.Linear(d_in, n_head*d_hidden, bias=False)
-        self.to_k = nn.Linear(d_in, n_head*d_hidden, bias=False)
-        self.to_v = nn.Linear(d_in, n_head*d_hidden, bias=False)
-
+        
+        self.query_key = nn.Linear(d_in, n_head * d_hidden, bias=False)
+        self.value = nn.Linear(d_in, n_head * d_hidden, bias=False)
         self.to_b = nn.Linear(d_in, n_head, bias=False)
-        self.to_g = nn.Linear(d_in, n_head*d_hidden)
-        self.to_out = nn.Linear(n_head*d_hidden, d_in)
+        self.to_g = nn.Linear(d_in, n_head * d_hidden)
+        self.to_out = nn.Linear(n_head * d_hidden, d_in)
 
-        self.scaling = 1/math.sqrt(d_hidden)
+        self.scaling = 1 / math.sqrt(d_hidden)
         self.h = n_head
         self.dim = d_hidden
 
@@ -347,54 +345,52 @@ class AttentionWithBias(nn.Module):
 
     def reset_parameter(self):
         # query/key/value projection: Glorot uniform / Xavier uniform
-        nn.init.xavier_uniform_(self.to_q.weight)
-        nn.init.xavier_uniform_(self.to_k.weight)
-        nn.init.xavier_uniform_(self.to_v.weight)
+        nn.init.xavier_uniform_(self.query_key.weight)
+        nn.init.xavier_uniform_(self.value.weight)
 
         # bias: normal distribution
         self.to_b = init_lecun_normal(self.to_b)
 
-        # gating: zero weights, one biases (mostly open gate at the begining)
+        # gating: zero weights, one biases (mostly open gate at the beginning)
         nn.init.zeros_(self.to_g.weight)
         nn.init.ones_(self.to_g.bias)
 
-        # to_out: right before residual connection: zero initialize -- to make it sure residual operation is same to the Identity at the begining
+        # to_out: right before residual connection: zero initialize -- to make sure the residual operation is the same as the Identity at the beginning
         nn.init.zeros_(self.to_out.weight)
         nn.init.zeros_(self.to_out.bias)
 
     def forward(self, x, bias, E_idx, mask_attend):
         B, L = x.shape[:2]
-        #
-        x = self.norm_in(x)
-        # bias = rearrange(bias, 'b l t h -> b l h t')
-        # bias = self.norm_bias(bias)
-        # bias = rearrange(bias, 'b l h t -> b l t h')
-        #
-        query = self.to_q(x).reshape(B, L, self.h, self.dim)
-        key = self.to_k(x).reshape(B, L, self.h, self.dim)
-        value = self.to_v(x).reshape(B, L, self.h, self.dim)
+        device = x.device
+        
+        # Combine normalization and transformation
+        x_norm = self.norm_in(x)
+        x_query_key = self.query_key(x_norm).reshape(B, L, self.h, self.dim)
+        x_value = self.value(x_norm).reshape(B, L, self.h, self.dim)
+        
+        # Combine bias normalization
+        bias = self.norm_bias(bias)
+#         bias = self.norm_bias2(bias)
 
         B, L, I, H = bias.shape
-        input_tensor = torch.zeros((B, L, L, H), device=bias.device)
+        input_tensor = torch.zeros((B, L, L, H), device=device)
         expanded_E_idx = E_idx.unsqueeze(3).expand(-1, -1, -1, H)
-        # bias = self.norm_bias(bias)
         bias = torch.scatter(input_tensor, 2, expanded_E_idx, bias)
         bias = self.to_b(bias)
-        bias = self.norm_bias2(bias)
         
-        input_tensor = torch.zeros((B, L, L), device=bias.device)
-        mask = torch.scatter(input_tensor, 2, E_idx, mask_attend)
-        mask = mask.unsqueeze(1).expand(-1, self.h, -1, -1)
-        gate = torch.sigmoid(self.to_g(x))
-
-        key = key * self.scaling
-        # attn = einsum('bqhd,bkhd->bqkh', query, key)
-        # attn = attn + bias
-        # attn = F.softmax(attn, dim=-1)
-        # #
-        # out = einsum('bqkh,bkhd->bqhd', attn, value).reshape(B, L, -1)
-        out = efficient_dot_product_attention_pt(query, key, value, mask.to(torch.bool), \
-                                           bias.transpose(-1,1)).reshape(B, L, -1)
+        # Compute the gating mechanism
+        gate = torch.sigmoid(self.to_g(x_norm))
+        
+        # Compute the attention weights using batch matrix multiplication (bmm)
+        query_key_scaled = x_query_key * self.scaling
+        attn = einsum('bqhd,bkhd->bqkh', query_key_scaled, x_query_key)
+        attn = attn + bias
+        attn = F.softmax(attn, dim=-1)
+        
+        # Apply attention to value
+        out = einsum('bqkh,bkhd->bqhd', attn, x_value).reshape(B, L, -1)
+        
+        # Apply the gating mechanism
         out = gate * out
         #
         out = self.to_out(out)
