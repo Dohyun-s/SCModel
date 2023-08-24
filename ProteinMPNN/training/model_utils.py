@@ -508,5 +508,11 @@ class NoamOpt:
 
 def get_std_opt(parameters, d_model, step):
     return NoamOpt(
-        d_model, 2, 4000, torch.optim.Adam(parameters, lr=0, betas=(0.9, 0.98), eps=1e-9), step
+        d_model, 2, 4000, torch.optim.AdamW(parameters, lr=0.001, betas=(0.9, 0.98), eps=1e-9), step
+    )
+
+def get_scheduler(optimizer, warmup_steps):
+    return torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=10, gamma=0.1
     )

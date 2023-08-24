@@ -15,6 +15,9 @@ def torsionAngleLoss( alpha, alphanat, alphanat_alt, tors_mask, tors_planar, eps
             torch.sum(torch.square( anorm - alphanat_alt[None] ),dim=-1)
         )
 
+    # l_tors = torch.sum( l_tors_ij*tors_mask[None] ) / ( torch.sqrt(torch.sum( tors_mask ))*I + eps)
+    # l_norm = torch.sum( torch.abs(lnat-1.0)*tors_mask[None] ) / (torch.sqrt(torch.sum( tors_mask ))*I + eps)
+    # l_planar = torch.sum( torch.abs( alpha[...,0] )*tors_planar[None] ) / (torch.sqrt(torch.sum( tors_planar ))*I + eps)
     l_tors = torch.sum( l_tors_ij*tors_mask[None] ) / (torch.sum( tors_mask )*I + eps)
     l_norm = torch.sum( torch.abs(lnat-1.0)*tors_mask[None] ) / (torch.sum( tors_mask )*I + eps)
     l_planar = torch.sum( torch.abs( alpha[...,0] )*tors_planar[None] ) / (torch.sum( tors_planar )*I + eps)

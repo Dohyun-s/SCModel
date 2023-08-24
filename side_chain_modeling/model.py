@@ -392,6 +392,7 @@ class AttentionWithBias(nn.Module):
         
         # Apply the gating mechanism
         out = gate * out
-        #
+
+        # Final transformation
         out = self.to_out(out)
         return out
