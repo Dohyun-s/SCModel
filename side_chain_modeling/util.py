@@ -144,7 +144,7 @@ def get_pdbs(data_loader, repeat=1, max_length=10000, num_units=1000000):
                             coords_dict_chain = {}
                             coords_dict_chain['dihedral_'+letter]=_dihedrals(all_atoms)
                             coords_dict_chain['omega'+letter]=omega6d
-                            coords_dict_chain['theta'+letter]=dist_ca
+                            coords_dict_chain['theta'+letter]=theta6d
                             coords_dict_chain['phi'+letter]=phi6d
                             coords_dict_chain['dist_ca_'+letter]=dist_ca
                             coords_dict_chain['xyz_coords']=all_atoms

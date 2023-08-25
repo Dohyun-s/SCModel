@@ -42,43 +42,16 @@ class ProteinMPNN(nn.Module):
         ])
         edge_in = num_positional_embeddings * 8 #+ self.num_rbf*25
         self.ln_post = nn.LayerNorm(hidden_dim)
-        self.embeddings = PositionalEncodings(num_positional_embeddings)
         self.attention_bias = AttentionWithBias(d_in=128, d_bias=32, n_head=8, d_hidden=16)
-        #         self.structure_projection = nn.Parameter(torch.randn(128, 512))
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-    
-    def _rbf(self, D):
-        device = D.device
-        D_min, D_max, D_count = 2., 22., self.num_rbf
-        D_mu = torch.linspace(D_min, D_max, D_count, device=device)
-        D_mu = D_mu.view([1,1,1,-1])
-        D_sigma = (D_max - D_min) / D_count
-        D_expand = torch.unsqueeze(D, -1)
-        RBF = torch.exp(-((D_expand - D_mu) / D_sigma)**2)
-        return RBF
-
-    def _get_rbf(self, A, B, E_idx):
-        D_A_B = torch.sqrt(torch.sum((A[:,:,None,:] - B[:,None,:,:])**2,-1) + 1e-6) #[B, L, L]
-        D_A_B_neighbors = gather_edges(D_A_B[:,:,:,None], E_idx)[:,:,:,0] #[B,L,K]
-        RBF_A_B = self._rbf(D_A_B_neighbors)
-        return RBF_A_B
-    
     def forward(self, dist_ca, omega, theta, phi, dihedral, mask_angle, mask, S, chain_M, residue_idx, chain_encoding_all):
         """ Graph-conditioned sequence model """
         device=dist_ca.device
         # Prepare node and edge embeddings
         V, E, E_idx = self.features(dist_ca, omega, theta, phi, dihedral, mask_angle, mask, S, residue_idx, chain_encoding_all)
-        # h_V = torch.zeros((E.shape[0], E.shape[1], E.shape[-1]), device=E.device)
-        # h_E = self.W_e(E)
-
-        # # Encoder is unmasked self-attention
-        # mask_attend = gather_nodes(mask.unsqueeze(-1),  E_idx).squeeze(-1)
-        # mask_attend = mask.unsqueeze(-1) * mask_attend
-        # for layer in self.encoder_layers:
-        #     h_V, h_E = torch.utils.checkpoint.checkpoint(layer, h_V, h_E, E_idx, mask, mask_attend)
         h_V = V.to(E.device)
         E_idx = E_idx.to(E.device)
         h_E = self.W_e(E)
@@ -151,7 +124,6 @@ class ProteinFeatures(nn.Module):
         E = self.edge_embedding(E)
         E = self.norm_edges(E)  # positional + ca-distance
         
-#         V = node_embe.cat((torch.unsqueeze(S, -1), dihedral), dim=-1)
         V = self.node_embedding(S)
         # V = V + dihedral
         V = torch.cat((V, dihedral), dim=-1)
@@ -297,7 +269,7 @@ class SCPred(nn.Module):
         si = si + self.linear_4(F.relu_(self.linear_3(F.relu_(si))))
 
         si = self.linear_out(F.relu_(si))
-        si /= torch.sqrt(torch.sum(torch.square(si), axis=-1, keepdims=True) + 1e-8)
+        si = si / torch.sqrt(torch.sum(torch.square(si), axis=-1, keepdims=True) + 1e-8)
         return si.view(B, L, self.NTOTAL, 2)
 
 def init_lecun_normal(module, scale=1.0):
@@ -370,7 +342,6 @@ class AttentionWithBias(nn.Module):
         
         # Combine bias normalization
         bias = self.norm_bias(bias)
-#         bias = self.norm_bias2(bias)
 
         B, L, I, H = bias.shape
         input_tensor = torch.zeros((B, L, L, H), device=device)
