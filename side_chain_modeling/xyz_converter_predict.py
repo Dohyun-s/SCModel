@@ -213,8 +213,6 @@ with torch.cuda.amp.autocast(True):
     from util_module import ComputeAllAtomCoords
     _, best_xyz = ComputeAllAtomCoords().forward(seq, xyz_prev, result[:,:len(test_batch[0]['seq_chain_A'])], use_H=False)
 best_xyz = best_xyz.float().cpu()
-import pdb
-pdb.set_trace()
 write_pdb(seq[0], best_xyz[0], prefix=test_batch[0]['name']+'_predict')
 
 # import os

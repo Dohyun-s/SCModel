@@ -1,5 +1,0 @@
-epoch: 1, step: 4, time: 127.4, train: 39.291, valid: 34.611, train_acc: 0.043, valid_acc: 0.039
-epoch: 2, step: 8, time: 132.6, train: 36.871, valid: 30.889, train_acc: 0.045, valid_acc: 0.069
-epoch: 3, step: 12, time: 127.0, train: 32.251, valid: 26.668, train_acc: 0.055, valid_acc: 0.078
-epoch: 4, step: 16, time: 122.9, train: 28.910, valid: 23.068, train_acc: 0.064, valid_acc: 0.082
-epoch: 5, step: 20, time: 126.9, train: 25.023, valid: 20.732, train_acc: 0.074, valid_acc: 0.086
